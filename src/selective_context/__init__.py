@@ -36,10 +36,16 @@ class LexicalUnits:
 
 class SelectiveContext:
 
-    def __init__(self, model_name = 'TheBloke/Llama-2-7B-Chat-GPTQ'):
+    def __init__(
+        self, 
+        model_name: str = 'TheBloke/Llama-2-7B-Chat-GPTQ', 
+        model_config: dict = {},
+        device: str = "cuda"
+    ):
 
         self.model_name = model_name
-        self.device = DEVICE
+        self.device = device
+        self.model_config = model_config
 
         # this means we calculate self-information sentence by sentence
         self.sent_level_self_info = True
@@ -65,13 +71,13 @@ class SelectiveContext:
         
         # Use AutoTokenizer and AutoModelForCausalLM for generalized support
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
             
             # Some models require legacy padding token
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
                 
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **self.model_config)
             self.model.to(self.device)
             self.model.eval()
             
