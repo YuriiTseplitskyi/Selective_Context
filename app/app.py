@@ -119,10 +119,15 @@ class SelectiveContext:
         else:
             prefixed_text = text  # Default with no special prefix
         
+        
         with torch.no_grad():
             # Tokenize the input text
             encoding = self.tokenizer(prefixed_text, add_special_tokens=False, return_tensors='pt')
             encoding = encoding.to(self.device)
+            
+            # Handle empty input case
+            if encoding['input_ids'].shape[1] == 0:
+                return [], []
             
             # Get model outputs
             outputs = self.model(**encoding)
@@ -134,21 +139,54 @@ class SelectiveContext:
             
             # Get input IDs for token decoding
             input_ids = encoding['input_ids']
-            input_ids_expanded = input_ids[:, 1:].unsqueeze(-1)
             
-            # Skip the prefix token in the result
-            skip_tokens = 1  # Number of prefix tokens to skip
-            tokens = [self.tokenizer.decode(token_id) for token_id in input_ids.squeeze().tolist()[skip_tokens:]]
-            token_self_info = self_info[:, skip_tokens-1:-1].gather(-1, input_ids_expanded[:, skip_tokens:]).squeeze(-1).squeeze(0).tolist()
+            # Handle the case where we might have only a single token
+            if input_ids.shape[1] <= 1:
+                # If we only have the prefix token, return empty lists
+                if prefixed_text != text:
+                    return [], []
+                # Otherwise decode the single token
+                token = self.tokenizer.decode(input_ids[0][0].item())
+                info_val = self_info[0, 0, input_ids[0][0].item()].item()
+                return [token], [info_val]
+            
+            # Skip the prefix token in the result if we added one
+            skip_tokens = 1 if prefixed_text != text else 0
+            
+            # Decode tokens and gather self-information
+            tokens = []
+            token_self_info = []
+            
+            # Process each token individually
+            for i in range(skip_tokens, input_ids.shape[1]-1):
+                token_id = input_ids[0, i].item()
+                next_token_id = input_ids[0, i+1].item()
+                
+                # Decode the token
+                token = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                tokens.append(token)
+                
+                # Get self-information for the next token
+                info_val = self_info[0, i, next_token_id].item()
+                token_self_info.append(info_val)
+            
+            # Add the last token if we're not skipping it (it will have no next token prediction)
+            if input_ids.shape[1] > skip_tokens:
+                last_token_id = input_ids[0, -1].item()
+                tokens.append(self.tokenizer.decode([last_token_id], skip_special_tokens=False))
+                # Use the average info value for the last token as there's no next token
+                if token_self_info:
+                    token_self_info.append(sum(token_self_info) / len(token_self_info))
+                else:
+                    token_self_info.append(0.0)
             
             # Store in cache
             result = (tokens, token_self_info)
             self._self_info_cache[cache_key] = result
             
             return result
-    
+        
     def _lexical_unit(self, sents):
-
         if self.sent_level_self_info:
             sent_self_info = []
             all_noun_phrases = []
@@ -157,20 +195,42 @@ class SelectiveContext:
             all_token_self_info = []
 
             for sent in sents:
-                # print(sent)
-                tokens, self_info = self.get_self_information(sent)
-                sent_self_info.append(np.mean(self_info))
+                try:
+                    # Get tokens and self-information
+                    tokens, self_info = self.get_self_information(sent)
+                    
+                    # Handle empty self_info arrays
+                    if not self_info:
+                        sent_self_info.append(0.0)  # Default value
+                    else:
+                        sent_self_info.append(np.mean(self_info))
 
-                all_tokens.extend(tokens)
-                all_token_self_info.extend(self_info)
+                    all_tokens.extend(tokens)
+                    all_token_self_info.extend(self_info)
 
-                noun_phrases, noun_phrases_info = self._calculate_lexical_unit(tokens, self_info)
+                    # Calculate lexical units
+                    noun_phrases, noun_phrases_info = self._calculate_lexical_unit(tokens, self_info)
 
-                # We need to add a space before the first noun phrase for every sentence except the first one
-                if all_noun_phrases:
-                    noun_phrases[0] = f" {noun_phrases[0]}"
-                all_noun_phrases.extend(noun_phrases)
-                all_noun_phrases_info.extend(noun_phrases_info)
+                    # We need to add a space before the first noun phrase for every sentence except the first one
+                    if noun_phrases and all_noun_phrases:
+                        noun_phrases[0] = f" {noun_phrases[0]}"
+                        
+                    all_noun_phrases.extend(noun_phrases)
+                    all_noun_phrases_info.extend(noun_phrases_info)
+                    
+                except Exception as e:
+                    print(f"Warning: Error processing sentence: '{sent[:50]}...'. Error: {e}")
+                    # Add default values if processing fails
+                    sent_self_info.append(0.0)
+            
+            # Ensure we have at least one item in each list
+            if not all_noun_phrases:
+                all_noun_phrases = [""]
+                all_noun_phrases_info = [0.0]
+                
+            if not all_tokens:
+                all_tokens = [""]
+                all_token_self_info = [0.0]
             
             return [
                 LexicalUnits('sent', text=sents, self_info=sent_self_info),
@@ -208,8 +268,44 @@ class SelectiveContext:
                         continue
                     unit_self_info[current_unit_idx].append(info)
             
-            unit_self_info_ = [np.mean(info) for info in unit_self_info]
+            # Handle empty lists by providing a default value
+            unit_self_info_ = []
+            for info_list in unit_self_info:
+                if not info_list:  # If the list is empty
+                    unit_self_info_.append(0.0)  # Use default value of 0.0
+                else:
+                    unit_self_info_.append(np.mean(info_list))
             return unit_self_info_
+        
+        def _noun_phrases(sent):
+            noun_phrases = []
+            doc = self.nlp(sent)
+            for index, chunk in enumerate(doc):
+                if index == 0:
+                    noun_phrases.append(chunk.text)
+                else:
+                    noun_phrases.append(doc[index-1].whitespace_ + chunk.text)
+            return noun_phrases
+
+        if self.sent_level_self_info:
+            # in this case, the self_info is for each sentence
+            # we only need to calculate the self_info for each phrase
+            sent = ''.join(tokens)
+            
+            try:
+                # Handle case where no noun phrases are found
+                noun_phrases = _noun_phrases(sent)
+                if not noun_phrases:
+                    # If no noun phrases, use the whole sentence as a single phrase
+                    noun_phrases = [sent]
+                    
+                noun_phrases_info = _unit_info(tokens, self_info, noun_phrases)
+                return noun_phrases, noun_phrases_info
+                
+            except Exception as e:
+                print(f"Warning: Error processing noun phrases: {e}")
+                # Return a fallback value
+                return [sent], [np.mean(self_info) if self_info else 0.0]
         
         def _noun_phrases(sent):
             noun_phrases = []
@@ -241,24 +337,41 @@ class SelectiveContext:
         # mask_level: mask sentences, phrases, or tokens
         sents_after_mask = []
         masked_sents = []
-                
-        self.ppl_threshold = np.nanpercentile(self_info, self.mask_ratio * 100)
-
-        # if title is not None:
-        #     with open(os.path.join(self.path, title+'_prob_token.tsv'), 'w', encoding='utf-8') as f:
-        #         for token, info in zip(tokens, self_info):
-        #             f.write(f"{token}\t{info}\n")
-        #     with open(os.path.join(self.path, title+'_prob_sent.tsv'), 'w', encoding='utf-8') as f:
-        #         for sent, info in zip(sents, sent_self_info):
-        #             f.write(f"{sent}\n{info}\n\n")
+        
+        # Handle empty inputs
+        if not sents or not self_info:
+            return "", []
+        
+        # Filter out NaN and None values from self_info
+        valid_info = [info for info in self_info if info is not None and not np.isnan(info)]
+        
+        # If no valid values, return original text
+        if not valid_info:
+            self.ppl_threshold = 0.0
+        else:
+            self.ppl_threshold = np.nanpercentile(self_info, self.mask_ratio * 100)
 
         for sent, info in zip(sents, self_info):
-            if info < self.ppl_threshold:
+            # Check for NaN or None values
+            if info is None or np.isnan(info):
+                sents_after_mask.append(sent)  # Keep the original text
+            elif info < self.ppl_threshold:
                 masked_sents.append(sent)
                 sents_after_mask.append(self.mask_a_sent(sent, mask_level))
             else:
                 sents_after_mask.append(sent)
-        masked_context = " ".join(sents_after_mask) if mask_level == 'sent' else "".join(sents_after_mask)
+        
+        # Join with proper spacing based on level
+        if mask_level == 'sent':
+            masked_context = " ".join(sents_after_mask)
+        else:
+            # For phrase and token level, be careful with spacing
+            masked_context = ""
+            for i, s in enumerate(sents_after_mask):
+                if i > 0 and s and not s.startswith(" ") and not masked_context.endswith(" "):
+                    masked_context += " " + s
+                else:
+                    masked_context += s
         
         return masked_context, masked_sents
 
@@ -275,24 +388,62 @@ class SelectiveContext:
             return ''
     
     def __call__(self, text: str, reduce_ratio: float = 0.35, reduce_level :str = 'phrase') -> List[str]:
+        """
+        Process text and reduce context based on specified level and ratio.
+        
+        Args:
+            text (str): Input text to process
+            reduce_ratio (float): Percentage of content to reduce (0.0 to 1.0)
+            reduce_level (str): Level at which to apply reduction ('sent', 'phrase', or 'token')
+        
+        Returns:
+            Tuple[str, List[str]]: Reduced context and masked content
+        """
         context = self.beautify_context(text)
-
         self.mask_ratio = reduce_ratio
 
-        sents = [sent.strip() for sent in re.split(self.sent_tokenize_pattern, context) if sent.strip()]
-
-        # You want the reduce happen at sentence level, phrase level, or token level?
-        assert reduce_level in ['sent', 'phrase', 'token'], f"reduce_level should be one of ['sent', 'phrase', 'token'], got {reduce_level}"
-        sent_lus, phrase_lus, token_lus = self._lexical_unit(sents)
-        lexical_level = {
-            'sent': sent_lus,
-            'phrase': phrase_lus,
-            'token': token_lus
-        }
-
-        # context is the reduced context, masked_sents denotes what context has been filtered out
-        context, masked_sents = self.self_info_mask(lexical_level[reduce_level].text, lexical_level[reduce_level].self_info, reduce_level)
-        return context, masked_sents
+        # First, ensure we preserve paragraph breaks
+        paragraphs = context.split("\n\n")
+        all_results = []
+        all_masked = []
+        
+        for para in paragraphs:
+            if not para.strip():
+                continue
+                
+            # Split into sentences
+            sents = [sent.strip() for sent in re.split(self.sent_tokenize_pattern, para) if sent.strip()]
+            
+            # You want the reduce happen at sentence level, phrase level, or token level?
+            assert reduce_level in ['sent', 'phrase', 'token'], f"reduce_level should be one of ['sent', 'phrase', 'token'], got {reduce_level}"
+            
+            try:
+                sent_lus, phrase_lus, token_lus = self._lexical_unit(sents)
+                
+                lexical_level = {
+                    'sent': sent_lus,
+                    'phrase': phrase_lus,
+                    'token': token_lus
+                }
+                
+                # context is the reduced context, masked_sents denotes what context has been filtered out
+                reduced_para, masked_sents = self.self_info_mask(
+                    lexical_level[reduce_level].text, 
+                    lexical_level[reduce_level].self_info, 
+                    reduce_level
+                )
+                
+                all_results.append(reduced_para)
+                all_masked.extend(masked_sents)
+                
+            except Exception as e:
+                print(f"Error processing paragraph: {e}")
+                all_results.append(para)  # Fall back to original paragraph
+        
+        # Join paragraphs with appropriate spacing
+        final_context = "\n\n".join(all_results)
+        
+        return final_context, all_masked
 
 def main(
     model_name = 'TheBloke/Llama-2-7B-Chat-GPTQ',
