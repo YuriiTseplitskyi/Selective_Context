@@ -28,10 +28,9 @@ To get started, follow these steps:
 
 1. Install `selective-context` via Pypi:
    ```
-   pip install selective-context
+   pip install git+https://github.com/YuriiTseplitskyi/Selective_Context.git
    python -m spacy download en_core_web_sm
    ```
-   If you are processing Chinese, run `python -m spacy download zh_core_web_sm` as well.
 
 2. Import `SelectiveContext`:
    ```
@@ -40,7 +39,7 @@ To get started, follow these steps:
 
 3. Compress your prompt and context. The `context` contains the compressed context:
    ```
-   sc = SelectiveContext(model_type='gpt2', lang='en')
+   sc = SelectiveContext(model_type='TheBloke/Llama-2-7B-Chat-GPTQ')
    context, reduced_content = sc(text)
    ```
 

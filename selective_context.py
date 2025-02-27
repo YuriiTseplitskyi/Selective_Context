@@ -36,7 +36,7 @@ class LexicalUnits:
 
 class SelectiveContext:
 
-    def __init__(self, model_type = 'gpt2'):
+    def __init__(self, model_type = 'TheBloke/Llama-2-7B-Chat-GPTQ'):
 
         self.model_type = model_type
         self.device = DEVICE
@@ -295,7 +295,7 @@ class SelectiveContext:
         return context, masked_sents
 
 def main(
-    model_type = 'gpt2', # you can choose from ['gpt2', 'curie'] # currenlty only support en and zh
+    model_type = 'TheBloke/Llama-2-7B-Chat-GPTQ',
     file_to_process: str = None,
     file_to_save: str = None,
 ):
@@ -328,4 +328,4 @@ def print_context_reduced_context(context, masked_sents):
 
 
 if __name__ == "__main__":
-    main(model_type='gpt2')
+    main(model_type='TheBloke/Llama-2-7B-Chat-GPTQ')
