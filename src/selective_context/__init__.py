@@ -1,5 +1,5 @@
 print('Loading dependencies...')
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, BertTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import re
 from typing import List, Tuple
@@ -36,10 +36,9 @@ class LexicalUnits:
 
 class SelectiveContext:
 
-    def __init__(self, model_type = 'gpt2', lang = 'en'):
+    def __init__(self, model_type = 'gpt2'):
 
         self.model_type = model_type
-        self.lang = lang
         self.device = DEVICE
 
         # this means we calculate self-information sentence by sentence
@@ -57,92 +56,97 @@ class SelectiveContext:
         # we use space to tokenize sentence into phrases
         # for English, we should use `spacy.load("en_core_web_sm").add_pipe('merge_noun_chunks')`
         # for Chinese, use `nlp = spacy.load('zh_core_web_sm')`` directly
-        lang = self.lang
-        if lang == "en":
-            self.nlp = spacy.load("en_core_web_sm", disable=["ner"])
-            self.nlp.add_pipe('merge_noun_chunks')
-        elif lang == "zh":
-            self.nlp = spacy.load('zh_core_web_sm', disable=["ner"])
+        self.nlp = spacy.load("en_core_web_sm", disable=["ner"])
+        self.nlp.add_pipe('merge_noun_chunks')
 
     def _prepare_model(self):
-        # Load tokenizer
-        if self.lang == 'zh':
-            self.tokenizer = BertTokenizer.from_pretrained('uer/gpt2-chinese-cluecorpussmall')
-        elif self.lang == 'en':
-            self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        else:
-            raise NotImplementedError()
+        """Load the language model and tokenizer from Hugging Face"""
+        print(f"Loading model: {self.model_name}")
         
-        if self.model_type == 'gpt2':
-            if self.lang == 'zh':
-                self.model = GPT2LMHeadModel.from_pretrained('uer/gpt2-chinese-cluecorpussmall')
-            else:
-                self.model = GPT2LMHeadModel.from_pretrained('gpt2')
+        # Use AutoTokenizer and AutoModelForCausalLM for generalized support
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            
+            # Some models require legacy padding token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
             self.model.to(self.device)
             self.model.eval()
-
-            print('model loaded')
-
-            self.max_token_length = self.model.config.n_positions
-            self.get_self_information = self._get_self_info_via_gpt2
-                
-        elif self.model_type == 'curie':
-            global openai
-            import openai
-            self.max_token_length = 2048
-
-            self.get_self_information = self._get_self_info_via_curie
+            
+            print(f"Model {self.model_name} loaded successfully")
+            
+            # Get model's max context length
+            if hasattr(self.model.config, "n_positions"):
+                self.max_token_length = self.model.config.n_positions
+            elif hasattr(self.model.config, "max_position_embeddings"):
+                self.max_token_length = self.model.config.max_position_embeddings
+            else:
+                self.max_token_length = 1024  # Default fallback
+                print(f"Warning: Could not determine model's maximum context length. Using default: {self.max_token_length}")
+            
+            self.get_self_information = self._get_self_info_via_hf_model
+            
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
     
     def get_self_information(self, text: str) -> Tuple[List[str], List[float]]:
         # it takes text as input, and return a list of words and a list of self-information scores
         raise NotImplementedError
 
-    def _get_self_info_via_gpt2(self, text: str) -> Tuple[List[str], List[float]]:
-        if self.lang == 'en':
-            text = f"<|endoftext|>{text}"
-        elif self.lang == 'zh':
-            text = f"[CLS]{text}"
+    def _get_self_info_via_hf_model(self, text: str) -> Tuple[List[str], List[float]]:
+        """
+        Generic function to calculate self-information using any Hugging Face model
+        
+        Includes caching to avoid recalculating for previously seen texts.
+        """
+        # Use cache if available
+        if not hasattr(self, '_self_info_cache'):
+            self._self_info_cache = {}
+        
+        # Check if result is in cache
+        cache_key = text
+        if cache_key in self._self_info_cache:
+            return self._self_info_cache[cache_key]
+        
+        # Add model-specific prefixes/tags if needed
+        if self.model_name.startswith('gpt2'):
+            prefixed_text = f"<|endoftext|>{text}"
+        elif "opt" in self.model_name:
+            prefixed_text = f"</s>{text}"
+        else:
+            prefixed_text = text  # Default with no special prefix
+        
         with torch.no_grad():
-            encoding = self.tokenizer(text, add_special_tokens=False, return_tensors='pt')
+            # Tokenize the input text
+            encoding = self.tokenizer(prefixed_text, add_special_tokens=False, return_tensors='pt')
             encoding = encoding.to(self.device)
+            
+            # Get model outputs
             outputs = self.model(**encoding)
             logits = outputs.logits
+            
+            # Calculate probabilities and self-information
             probs = torch.softmax(logits, dim=-1)
             self_info = -torch.log(probs)
-        
-        input_ids = encoding['input_ids']
-        input_ids_expaned = input_ids[:, 1:].unsqueeze(-1)
-
-        tokens = [self.tokenizer.decode(token_) for token_ in input_ids.squeeze().tolist()[1:]]
-        return tokens, self_info[:, :-1].gather(-1, input_ids_expaned).squeeze(-1).squeeze(0).tolist()
+            
+            # Get input IDs for token decoding
+            input_ids = encoding['input_ids']
+            input_ids_expanded = input_ids[:, 1:].unsqueeze(-1)
+            
+            # Skip the prefix token in the result
+            skip_tokens = 1  # Number of prefix tokens to skip
+            tokens = [self.tokenizer.decode(token_id) for token_id in input_ids.squeeze().tolist()[skip_tokens:]]
+            token_self_info = self_info[:, skip_tokens-1:-1].gather(-1, input_ids_expanded[:, skip_tokens:]).squeeze(-1).squeeze(0).tolist()
+            
+            # Store in cache
+            result = (tokens, token_self_info)
+            self._self_info_cache[cache_key] = result
+            
+            return result
     
-    def _get_self_info_via_curie(self, text: str) -> Tuple[List[str], List[float]]:
-        num_retry = 3
-        openai.api_key = os.environ["OPENAI_API_KEY"]
-
-        for _ in range(num_retry):
-            try:
-                r = openai.Completion.create(
-                    model="curie",
-                    prompt=f"<|endoftext|>{text}",
-                    max_tokens=0,
-                    temperature=0,
-                    echo=True,
-                    logprobs=0,
-                )
-                break
-            except Exception as e:
-                print(e)
-                time.sleep(1)
-
-        result = r['choices'][0]
-        tokens, logprobs = result["logprobs"]["tokens"][1:], result["logprobs"]["token_logprobs"][1:]
-
-        assert len(tokens) == len(logprobs), f"Expected {len(tokens)} logprobs, got {len(logprobs)}"
-
-        self_info = [ -logprob for logprob in logprobs]
-        return tokens, self_info
-
     def _lexical_unit(self, sents):
 
         if self.sent_level_self_info:
@@ -291,13 +295,12 @@ class SelectiveContext:
         return context, masked_sents
 
 def main(
-    model_type = 'gpt2', # you can choose from ['gpt2', 'curie']
-    lang = 'en', # currenlty only support en and zh
+    model_type = 'gpt2', # you can choose from ['gpt2', 'curie'] # currenlty only support en and zh
     file_to_process: str = None,
     file_to_save: str = None,
 ):
 
-    sc = SelectiveContext(model_type=model_type, lang=lang)
+    sc = SelectiveContext(model_type=model_type)
 
     if file_to_process is None:
         while True:
@@ -325,4 +328,4 @@ def print_context_reduced_context(context, masked_sents):
 
 
 if __name__ == "__main__":
-    main(model_type='gpt2', lang = 'zh')
+    main(model_type='gpt2')

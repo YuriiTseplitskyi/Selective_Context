@@ -1,15 +1,17 @@
-from transformers import GPT2Tokenizer, GPT2LMHeadModel, BertTokenizer
+print('Loading dependencies...')
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import streamlit as st
 import re
 from typing import List, Tuple
 import spacy
 import numpy as np
+import os
 from dataclasses import dataclass
 from nltk.tokenize import sent_tokenize, word_tokenize
+import time
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-st.set_page_config(layout="wide")
+print(f"Using device: {DEVICE}")
 
 @dataclass
 class LexicalUnits:
@@ -34,10 +36,10 @@ class LexicalUnits:
 
 class SelectiveContext:
 
-    def __init__(self, model_type = 'gpt2', lang = 'en'):
+    def __init__(self, model_type = 'gpt2'):
 
         self.model_type = model_type
-        self.lang = lang
+        self.device = DEVICE
 
         # this means we calculate self-information sentence by sentence
         self.sent_level_self_info = True
@@ -45,60 +47,106 @@ class SelectiveContext:
         self._prepare_phrase_tokenizer()
         self.sent_tokenize_pattern = r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s"
         self.phrase_mask_token = ''
-        self.sent_mask_token = "<deleted>"
-
+        self.sent_mask_token = "<...some content omitted.>"
+        self.keep_leading_word = False
+        self.mask_token = ''
         self._prepare_model()
     
     def _prepare_phrase_tokenizer(self):
         # we use space to tokenize sentence into phrases
         # for English, we should use `spacy.load("en_core_web_sm").add_pipe('merge_noun_chunks')`
         # for Chinese, use `nlp = spacy.load('zh_core_web_sm')`` directly
-        lang = self.lang
-        if lang == "en":
-            self.nlp = spacy.load("en_core_web_sm", disable=["ner"])
-            self.nlp.add_pipe('merge_noun_chunks')
-        elif lang == "zh":
-            self.nlp = spacy.load('zh_core_web_sm', disable=["ner"])
+        self.nlp = spacy.load("en_core_web_sm", disable=["ner"])
+        self.nlp.add_pipe('merge_noun_chunks')
 
     def _prepare_model(self):
-        if self.model_type == 'gpt2':
-            if self.lang == 'zh':
-                self.model = GPT2LMHeadModel.from_pretrained('uer/gpt2-chinese-cluecorpussmall')
-                self.tokenizer = BertTokenizer.from_pretrained('uer/gpt2-chinese-cluecorpussmall')
-            else:
-                self.model = GPT2LMHeadModel.from_pretrained('gpt2')
-                self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-            self.model.to(DEVICE)
+        """Load the language model and tokenizer from Hugging Face"""
+        print(f"Loading model: {self.model_name}")
+        
+        # Use AutoTokenizer and AutoModelForCausalLM for generalized support
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            
+            # Some models require legacy padding token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+            self.model.to(self.device)
             self.model.eval()
-
-            print('model loaded')
-
-            self.max_token_length = self.model.config.n_positions
-            self.get_self_information = self._get_self_info_via_gpt2
+            
+            print(f"Model {self.model_name} loaded successfully")
+            
+            # Get model's max context length
+            if hasattr(self.model.config, "n_positions"):
+                self.max_token_length = self.model.config.n_positions
+            elif hasattr(self.model.config, "max_position_embeddings"):
+                self.max_token_length = self.model.config.max_position_embeddings
+            else:
+                self.max_token_length = 1024  # Default fallback
+                print(f"Warning: Could not determine model's maximum context length. Using default: {self.max_token_length}")
+            
+            self.get_self_information = self._get_self_info_via_hf_model
+            
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
     
     def get_self_information(self, text: str) -> Tuple[List[str], List[float]]:
         # it takes text as input, and return a list of words and a list of self-information scores
         raise NotImplementedError
 
-    def _get_self_info_via_gpt2(self, text: str) -> Tuple[List[str], List[float]]:
-        if self.lang == 'en':
-            text = f"<|endoftext|>{text}"
-        elif self.lang == 'zh':
-            text = f"[CLS]{text}"
+    def _get_self_info_via_hf_model(self, text: str) -> Tuple[List[str], List[float]]:
+        """
+        Generic function to calculate self-information using any Hugging Face model
+        
+        Includes caching to avoid recalculating for previously seen texts.
+        """
+        # Use cache if available
+        if not hasattr(self, '_self_info_cache'):
+            self._self_info_cache = {}
+        
+        # Check if result is in cache
+        cache_key = text
+        if cache_key in self._self_info_cache:
+            return self._self_info_cache[cache_key]
+        
+        # Add model-specific prefixes/tags if needed
+        if self.model_name.startswith('gpt2'):
+            prefixed_text = f"<|endoftext|>{text}"
+        elif "opt" in self.model_name:
+            prefixed_text = f"</s>{text}"
+        else:
+            prefixed_text = text  # Default with no special prefix
+        
         with torch.no_grad():
-            encoding = self.tokenizer(text, add_special_tokens=False, return_tensors='pt')
-            encoding = encoding.to(DEVICE)
+            # Tokenize the input text
+            encoding = self.tokenizer(prefixed_text, add_special_tokens=False, return_tensors='pt')
+            encoding = encoding.to(self.device)
+            
+            # Get model outputs
             outputs = self.model(**encoding)
             logits = outputs.logits
+            
+            # Calculate probabilities and self-information
             probs = torch.softmax(logits, dim=-1)
             self_info = -torch.log(probs)
-        
-        input_ids = encoding['input_ids']
-        input_ids_expaned = input_ids[:, 1:].unsqueeze(-1)
-
-        tokens = [self.tokenizer.decode(token_) for token_ in input_ids.squeeze().tolist()[1:]]
-        return tokens, self_info[:, :-1].gather(-1, input_ids_expaned).squeeze(-1).squeeze(0).tolist()
-
+            
+            # Get input IDs for token decoding
+            input_ids = encoding['input_ids']
+            input_ids_expanded = input_ids[:, 1:].unsqueeze(-1)
+            
+            # Skip the prefix token in the result
+            skip_tokens = 1  # Number of prefix tokens to skip
+            tokens = [self.tokenizer.decode(token_id) for token_id in input_ids.squeeze().tolist()[skip_tokens:]]
+            token_self_info = self_info[:, skip_tokens-1:-1].gather(-1, input_ids_expanded[:, skip_tokens:]).squeeze(-1).squeeze(0).tolist()
+            
+            # Store in cache
+            result = (tokens, token_self_info)
+            self._self_info_cache[cache_key] = result
+            
+            return result
+    
     def _lexical_unit(self, sents):
 
         if self.sent_level_self_info:
@@ -109,7 +157,7 @@ class SelectiveContext:
             all_token_self_info = []
 
             for sent in sents:
-                print(sent)
+                # print(sent)
                 tokens, self_info = self.get_self_information(sent)
                 sent_self_info.append(np.mean(self_info))
 
@@ -119,7 +167,7 @@ class SelectiveContext:
                 noun_phrases, noun_phrases_info = self._calculate_lexical_unit(tokens, self_info)
 
                 # We need to add a space before the first noun phrase for every sentence except the first one
-                if len(all_noun_phrases) != 0:
+                if all_noun_phrases:
                     noun_phrases[0] = f" {noun_phrases[0]}"
                 all_noun_phrases.extend(noun_phrases)
                 all_noun_phrases_info.extend(noun_phrases_info)
@@ -218,7 +266,11 @@ class SelectiveContext:
         if level == 'phrase':
             return self.phrase_mask_token
         elif level == 'sent':
-            return self.sent_mask_token
+            if self.keep_leading_word:
+                leading_few_words = " ".join(word_tokenize(sent)[:self.num_lead_words]) + " "
+            else:
+                leading_few_words = ""
+            return leading_few_words + self.mask_token
         elif level == 'token':
             return ''
     
@@ -227,8 +279,7 @@ class SelectiveContext:
 
         self.mask_ratio = reduce_ratio
 
-        sents = re.split(self.sent_tokenize_pattern, context)
-        sents = [sent.strip() for sent in sents if sent.strip()]
+        sents = [sent.strip() for sent in re.split(self.sent_tokenize_pattern, context) if sent.strip()]
 
         # You want the reduce happen at sentence level, phrase level, or token level?
         assert reduce_level in ['sent', 'phrase', 'token'], f"reduce_level should be one of ['sent', 'phrase', 'token'], got {reduce_level}"
@@ -242,35 +293,39 @@ class SelectiveContext:
         # context is the reduced context, masked_sents denotes what context has been filtered out
         context, masked_sents = self.self_info_mask(lexical_level[reduce_level].text, lexical_level[reduce_level].self_info, reduce_level)
         return context, masked_sents
-    
-# streamlit app.py
-# here we ask the user to input the text and the reduce ratio
-# then we call the SelectiveContext to compress the text
 
-st.title("Selective Context: Compress your prompt")
-st.markdown("This is a demo for the **Selective Context** algorithm.")
-st.markdown("Use this algorithm to **compress** your prompt, so that LLMs can deal with **2x more context**!")
-st.markdown("- The algorithm filters out the content that is less informative. \n - You can also choose to filter out phrases or tokens instead of sentences. \n - Checkout the paper for details and experiments! [https://arxiv.org/abs/2304.12102](https://arxiv.org/abs/2304.12102).")
-st.write("")
+def main(
+    model_type = 'gpt2', # you can choose from ['gpt2', 'curie'] # currenlty only support en and zh
+    file_to_process: str = None,
+    file_to_save: str = None,
+):
 
-st.subheader("Demo")
+    sc = SelectiveContext(model_type=model_type)
 
-lang = st.radio("Please choose the language: ", ('en', 'zh'))
-ratio = st.radio("Please choose the compress ratio [we recommend 0.5]: ", (0.5, 0.2, 0.35, 0.65, 0.8))
-reduce_level = st.radio("Please choose the reduce level: ", ('phrase', 'token', 'sent'))
+    if file_to_process is None:
+        while True:
+            text = input("Please input the text you want to reduce: ")
+            if text == 'exit':
+                break
+            context, masked_sents = sc(text)
+            print_context_reduced_context(context, masked_sents)
+    else:
+        with open(file_to_process, 'r') as f:
+            text = f.read()
+        context, masked_sents = sc(text)
+        if file_to_save is not None:
+            with open(file_to_save, 'w') as f:
+                f.write(context)
+        else:
+            print_context_reduced_context(context, masked_sents)
 
-text = st.text_area("Please input your text here", height=300)
 
-@st.cache_resource()
-def load_model(lang):
-    model = SelectiveContext(lang=lang)
-    return model
+def print_context_reduced_context(context, masked_sents):
+    print('***********\nThe resultsing context is: \n')
+    print(context, '\n\n')
+    print('***********\nThe content that has been filtered out is: \n')
+    print(masked_sents, '\n\n')
 
-if st.button("Compress"):
-    model = load_model(lang)
-    context, masked_sents = model(text, reduce_ratio=ratio, reduce_level=reduce_level)
-    st.subheader("The compressed context is:")
-    st.code(context)
-    # st.divider()
-    st.subheader("The filtered out content is:")
-    st.write(masked_sents)
+
+if __name__ == "__main__":
+    main(model_type='gpt2')
