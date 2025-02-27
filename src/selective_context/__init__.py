@@ -36,9 +36,9 @@ class LexicalUnits:
 
 class SelectiveContext:
 
-    def __init__(self, model_type = 'TheBloke/Llama-2-7B-Chat-GPTQ'):
+    def __init__(self, model_name = 'TheBloke/Llama-2-7B-Chat-GPTQ'):
 
-        self.model_type = model_type
+        self.model_name = model_name
         self.device = DEVICE
 
         # this means we calculate self-information sentence by sentence
@@ -295,12 +295,12 @@ class SelectiveContext:
         return context, masked_sents
 
 def main(
-    model_type = 'TheBloke/Llama-2-7B-Chat-GPTQ',
+    model_name = 'TheBloke/Llama-2-7B-Chat-GPTQ',
     file_to_process: str = None,
     file_to_save: str = None,
 ):
 
-    sc = SelectiveContext(model_type=model_type)
+    sc = SelectiveContext(model_name=model_name)
 
     if file_to_process is None:
         while True:
@@ -328,4 +328,4 @@ def print_context_reduced_context(context, masked_sents):
 
 
 if __name__ == "__main__":
-    main(model_type='TheBloke/Llama-2-7B-Chat-GPTQ')
+    main(model_name='TheBloke/Llama-2-7B-Chat-GPTQ')
