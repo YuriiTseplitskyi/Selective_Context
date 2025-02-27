@@ -5,7 +5,7 @@ requires = ["setuptools", "wheel"]
 name = "selective-context"
 version = "0.1.4"
 description = "Compress your prompt and context to let LLMs deal with 2x more content."
-authors = [{name = "Yucheng Li", email = "liyucheng09@gmail.com"}]
+authors = [{name = "YuriiTseplitskyi", email = "yura05032004@gmail.com"}]
 readme = "readme.md"
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -24,4 +24,4 @@ dependencies = [
 requires-python = ">=3.7"
 
     [project.urls]
-    repository    = "https://github.com/liyucheng09/Selective_Context"
+    repository    = "https://github.com/YuriiTseplitskyi/Selective_Context"
